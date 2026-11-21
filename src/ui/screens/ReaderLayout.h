@@ -5,6 +5,7 @@
 #include "ui/Ui.h"
 
 namespace screens::readerLayout {
+    inline constexpr uint8_t kPreviewRows = 3;
     size_t pageStrikeIndex();
     ui::Rect readingArea(int16_t width, int16_t height, bool verticalPage);
     ui::Rect batteryRect(int16_t width, int16_t height);
@@ -38,6 +39,10 @@ namespace screens::readerLayout {
         uint32_t topState;
         uint32_t bottomState;
         bool ghostHidden = false;
+        uint8_t percent = 0;
+        bool canRead = true;
+        uint8_t pressedControl = 0;
+        bool pausePending = false;
     };
     void drawArrows(ui::Context& ui, const settings::ReadingSettings& settings, bool reading, int16_t wordHeight,
                     bool ghostHidden = false);

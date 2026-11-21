@@ -20,6 +20,7 @@
 #include "ui/Ui.h"
 #include "ui/screens/ChaptersScreen.h"
 #include "ui/screens/PageReaderScreen.h"
+#include "ui/screens/ReaderLayout.h"
 #include "ui/screens/Screens.h"
 
 namespace {
@@ -442,6 +443,27 @@ void test_missing_sample_does_not_interrupt_active_touch() {
     TEST_ASSERT_FALSE(ui::hasTouch(*context.touch(), ui::TouchTap));
 }
 
+void test_touch_loading_transition_requires_a_fresh_press() {
+    Arduino_GFX gfx;
+    ui::Context context(gfx);
+    enableTouch(context);
+    gContact = {true, 20, 10};
+    TEST_ASSERT_TRUE(context.pollTouch(1));
+    context.cancelTouchUntilRelease();
+    TEST_ASSERT_NULL(context.touch());
+    TEST_ASSERT_FALSE(context.pollTouch(2));
+    gContact = {false, 20, 10};
+    TEST_ASSERT_FALSE(context.pollTouch(3));
+    gContact = {true, 20, 10};
+    TEST_ASSERT_TRUE(context.pollTouch(4));
+    TEST_ASSERT_TRUE(ui::hasTouch(*context.touch(), ui::TouchStart));
+    gContact = {false, 20, 10};
+    TEST_ASSERT_TRUE(context.pollTouch(5));
+    context.cancelTouchUntilRelease();
+    gContact = {true, 20, 10};
+    TEST_ASSERT_TRUE(context.pollTouch(6)); // no unnecessary extra tap when already released
+}
+
 void test_touch_reset_cancels_active_gesture() {
     Arduino_GFX gfx;
     ui::Context context(gfx);
@@ -454,6 +476,7 @@ void test_touch_reset_cancels_active_gesture() {
 
     gTouchResult = ui::TouchSampleResult::Reset;
     TEST_ASSERT_TRUE(context.pollTouch(3));
+    TEST_ASSERT_TRUE(ui::hasTouch(*context.touch(), ui::TouchCancel));
     TEST_ASSERT_TRUE(ui::hasTouch(*context.touch(), ui::TouchRelease));
     TEST_ASSERT_FALSE(ui::hasTouch(*context.touch(), ui::TouchTap));
     TEST_ASSERT_EQUAL(60, context.touch()->x);
@@ -598,6 +621,50 @@ void test_portrait_rects_map_to_the_landscape_framebuffer() {
     TEST_ASSERT_TRUE(ui::Rect({58, 6, 534, 30}) == ui::rotateClockwise({136, 58, 30, 534}, 172));
     TEST_ASSERT_TRUE(ui::contains(ui::rotateClockwise({6, 4, 92, 30}, 172), 10, 100));
     TEST_ASSERT_FALSE(ui::contains(ui::rotateClockwise({6, 4, 92, 30}, 172), 100, 10));
+}
+
+void test_page_preview_keeps_three_rows_across_paragraphs_and_invalidates_on_exit() {
+    Arduino_GFX gfx(136, 100);
+    ui::Context context(gfx);
+    ui::fonts::AlphaTextRenderer<640> text(gfx);
+    TEST_ASSERT_TRUE(text.begin());
+    auto colors = theme();
+    context.setTheme(colors);
+    settings::TypographySettings typography;
+    std::array<std::string, 24> words;
+    words.fill("a");
+    ReadingSession session;
+    ReadingLoop::setWords(session, words, 0);
+    for (size_t i = 0; i < words.size(); ++i)
+        session.metadata.paragraphStarts.push_back(i);
+    screens::PageReader::State state;
+    auto font = kReaderFont;
+    font.wordInkTop = -21;
+    font.wordInkBottom = 5;
+    const auto typeface = [&](size_t) -> FontCatalog::Face { return {std::cref(font), nullptr}; };
+    constexpr ui::Rect area{0, 0, 136, 100};
+    context.beginFrame(1);
+    screens::PageReader::draw(state, context, text, typeface, typography, 1, session, area, {}, screens::readerLayout::kPreviewRows);
+    context.endFrame();
+    TEST_ASSERT_EQUAL(3, state.lineCount);
+    TEST_ASSERT_EQUAL(3, state.pageEnd);
+    for (size_t i = 0; i < state.lineCount; ++i) {
+        TEST_ASSERT_GREATER_OR_EQUAL(state.lines[i].top, state.lines[i].y + font.wordInkTop);
+        TEST_ASSERT_LESS_THAN(state.lines[i].bottom, state.lines[i].y + font.wordInkBottom);
+        if (i)
+            TEST_ASSERT_EQUAL(30, state.lines[i].y - state.lines[i - 1].y);
+    }
+    ReadingLoop::seekTo(session, 18);
+    context.beginFrame(2);
+    screens::PageReader::draw(state, context, text, typeface, typography, 1, session, area, {}, screens::readerLayout::kPreviewRows);
+    context.endFrame();
+    TEST_ASSERT_TRUE(state.pageStart <= 18 && state.pageEnd > 18);
+    TEST_ASSERT_EQUAL(3, state.lineCount);
+    context.beginFrame(3);
+    screens::PageReader::draw(state, context, text, typeface, typography, 1, session, area);
+    context.endFrame();
+    TEST_ASSERT_EQUAL(0, state.fixedLineCount);
+    TEST_ASSERT_GREATER_THAN(3, state.lineCount);
 }
 
 void test_page_reader_reselects_typeface_after_seek_or_invalidation() {
@@ -873,14 +940,16 @@ void test_reader_streams_rfont4_glyphs_from_file() {
 
     RFont4::Header header;
     std::memcpy(&header, bytes.data(), sizeof(header));
-    std::array<RFont4::StrikeRecord, RFont4::kSizeCount> strikes;
-    std::memcpy(strikes.data(), bytes.data() + header.strikesOffset, sizeof(strikes));
+    std::array<RFont4::StrikeRecord, RFont4::kStrikeCount> strikes{};
+    TEST_ASSERT_TRUE(RFont4::headerValid(header, bytes.size()));
+    std::memcpy(strikes.data(), bytes.data() + header.strikesOffset,
+                header.strikeCount * sizeof(RFont4::StrikeRecord));
     std::array<RFont4::LayoutTableRecord, RFont4::kMaximumLayoutTableCount> tables{};
     std::memcpy(tables.data(), bytes.data() + header.layoutTablesOffset,
                 static_cast<size_t>(header.layoutTableCount) * sizeof(tables.front()));
     TEST_ASSERT_TRUE(RFont4::layoutValid(header, strikes, std::span{tables}.first(header.layoutTableCount),
                                          bytes.size()));
-    const RFont4::StrikeRecord& strike = strikes.back();
+    const RFont4::StrikeRecord& strike = strikes[RFont4::kCompactStrikeIndex];
 
     std::array<uint8_t, RFont4::kPageMapBytes> pageMap;
     std::memcpy(pageMap.data(), bytes.data() + header.pageMapOffset, pageMap.size());
@@ -1064,6 +1133,48 @@ void test_page_reader_maps_vertical_columns_to_the_landscape_framebuffer() {
     TEST_ASSERT_GREATER_THAN(0, gfx.writes);
 }
 
+void test_vertical_page_preview_limits_rows_and_restores_page_layout() {
+    Arduino_GFX gfx(50, 100);
+    ui::Context context(gfx);
+    ui::fonts::AlphaTextRenderer<640> text(gfx);
+    TEST_ASSERT_TRUE(text.begin());
+    context.setTheme(theme());
+    settings::TypographySettings typography;
+    std::array<std::string, 30> words;
+    words.fill("日");
+    ReadingSession session;
+    ReadingLoop::setWords(session, words, 0);
+    session.metadata.writingMode = WritingMode::verticalRl;
+    session.metadata.paragraphStarts = {0};
+    screens::PageReader::State state;
+    const auto typeface = [](size_t) -> FontCatalog::Face {
+        return {std::cref(kReaderFont), nullptr};
+    };
+    constexpr ui::Rect area{0, 0, 50, 100};
+
+    context.beginFrame(1);
+    screens::PageReader::draw(state, context, text, typeface, typography, 1, session, area, {},
+                              screens::readerLayout::kPreviewRows);
+    context.endFrame();
+    TEST_ASSERT_TRUE(state.vertical);
+    TEST_ASSERT_FALSE(state.words.empty());
+    const size_t previewEnd = state.pageEnd;
+    size_t rows = 1;
+    for (size_t index = 1; index < state.words.size(); ++index) {
+        if (state.words[index].y != state.words[index - 1].y) {
+            TEST_ASSERT_EQUAL(30, state.words[index].y - state.words[index - 1].y);
+            ++rows;
+        }
+    }
+    TEST_ASSERT_EQUAL(3, rows);
+
+    context.beginFrame(2);
+    screens::PageReader::draw(state, context, text, typeface, typography, 1, session, area);
+    context.endFrame();
+    TEST_ASSERT_EQUAL(0, state.fixedLineCount);
+    TEST_ASSERT_GREATER_THAN(previewEnd, state.pageEnd);
+}
+
 void test_labels_redraw_when_text_or_locale_changes() {
     Arduino_GFX gfx(320, 172);
     ui::Context context(gfx);
@@ -1222,6 +1333,26 @@ void test_setting_gives_long_values_the_full_card_width() {
     context.slider({0, 0, 200, 50}, "Long words", longWordDelay, 0, 600, 50, " ms");
     context.endFrame();
     TEST_ASSERT_EQUAL(16, gfx.textWrites);
+}
+
+void test_filled_slider_discards_preview_on_touch_reset_and_screen_change() {
+    Arduino_GFX gfx(640,172);
+    ui::Context context(gfx);auto colors=theme();context.setTheme(colors);
+    context.setModernPresentation(true);enableTouch(context);
+    int delay=200;uint32_t now=0;
+    const auto frame=[&](uint8_t screen) {
+        context.pollTouch(++now);context.beginFrame(screen);
+        const bool changed=context.slider({12,49,198,50},"Punctuation",delay,0,600,50," ms");
+        context.endFrame();return changed;
+    };
+    gContact={true,209,60};TEST_ASSERT_FALSE(frame(1));TEST_ASSERT_EQUAL(200,delay);
+    gTouchResult=ui::TouchSampleResult::Reset;
+    TEST_ASSERT_FALSE(frame(1));TEST_ASSERT_EQUAL(200,delay);
+    gTouchResult=ui::TouchSampleResult::Contact;
+    gContact={true,209,60};TEST_ASSERT_FALSE(frame(1));
+    gContact={false,209,60};TEST_ASSERT_FALSE(frame(2));TEST_ASSERT_EQUAL(200,delay);
+    gContact={true,209,60};TEST_ASSERT_FALSE(frame(2));
+    gContact={false,209,60};TEST_ASSERT_TRUE(frame(2));TEST_ASSERT_EQUAL(600,delay);
 }
 
 void test_slider_redraws_with_its_active_color() {
@@ -1662,8 +1793,35 @@ void test_appearance_controls_fit_lcd() {
     TEST_ASSERT_EQUAL(128, editor.reader.chapter.y);
 }
 
+void test_page_browse_scrolls_without_changing_saved_reader_position() {
+    Arduino_GFX gfx(136, 172);
+    ui::Context context(gfx);
+    ui::fonts::AlphaTextRenderer<640> text(gfx);
+    TEST_ASSERT_TRUE(text.begin());auto colors=theme();context.setTheme(colors);
+    std::array<std::string,100> words;words.fill("word");
+    ReadingSession session;ReadingLoop::setWords(session,words,0);
+    screens::PageReader::BrowseState browse;
+    settings::TypographySettings typography;
+    const auto typeface=[](size_t)->FontCatalog::Face{return {std::cref(kReaderFont),nullptr};};
+    const ui::Rect area{0,30,136,48};
+    const auto render=[&]{context.beginFrame(1);screens::PageReader::browse(browse,context,text,typeface,typography,1,session,area,0);context.endFrame();};
+    render();const auto first=browse.first;
+    browse.offset+=38;render();
+    TEST_ASSERT_GREATER_THAN(first,browse.first);
+    TEST_ASSERT_EQUAL(0,session.state.wordIndex);
+    browse.offset-=38;render();
+    TEST_ASSERT_EQUAL(first,browse.first);
+    const auto& word=browse.layout.words.front();
+    const auto& line=browse.layout.lines.front();
+    TEST_ASSERT_EQUAL(browse.first,screens::PageReader::wordAtPoint(browse,word.x+1,line.top+2));
+    browse.offset=10000;render();
+    TEST_ASSERT_LESS_THAN(words.size(),browse.first);
+    TEST_ASSERT_EQUAL(0,session.state.wordIndex);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
+    RUN_TEST(test_page_browse_scrolls_without_changing_saved_reader_position);
     RUN_TEST(test_unchanged_widget_does_not_draw_or_flush);
     RUN_TEST(test_reader_font_resolves_opentype_glyph_ids);
     RUN_TEST(test_reader_batches_adjacent_shaped_glyphs);
@@ -1676,6 +1834,7 @@ int main(int, char**) {
     RUN_TEST(test_slow_press_remains_tap_until_hold_threshold);
     RUN_TEST(test_missing_sample_does_not_interrupt_active_touch);
     RUN_TEST(test_touch_reset_cancels_active_gesture);
+    RUN_TEST(test_touch_loading_transition_requires_a_fresh_press);
     RUN_TEST(test_queued_touch_uses_sample_time_instead_of_ui_time);
     RUN_TEST(test_stepper_taps_and_repeats);
     RUN_TEST(test_disabled_button_ignores_touch);
@@ -1683,10 +1842,12 @@ int main(int, char**) {
     RUN_TEST(test_layout_cursors_are_deterministic);
     RUN_TEST(test_rect_intersection_clips_each_edge);
     RUN_TEST(test_portrait_rects_map_to_the_landscape_framebuffer);
+    RUN_TEST(test_page_preview_keeps_three_rows_across_paragraphs_and_invalidates_on_exit);
     RUN_TEST(test_page_reader_reselects_typeface_after_seek_or_invalidation);
     RUN_TEST(test_page_reader_reanchors_distant_forward_seek_without_laying_out_intermediate_pages);
     RUN_TEST(test_page_reader_uses_each_words_selected_typeface_for_layout);
     RUN_TEST(test_page_reader_maps_vertical_columns_to_the_landscape_framebuffer);
+    RUN_TEST(test_vertical_page_preview_limits_rows_and_restores_page_layout);
     RUN_TEST(test_page_reader_caches_visual_bidi_layout);
     RUN_TEST(test_page_reader_only_runs_bidi_for_pages_that_need_it);
     RUN_TEST(test_page_reader_shapes_each_visible_word_once_and_caches_glyphs);
@@ -1705,6 +1866,7 @@ int main(int, char**) {
     RUN_TEST(test_labels_align_and_battery_owns_its_drawing);
     RUN_TEST(test_setting_gives_long_values_the_full_card_width);
     RUN_TEST(test_slider_redraws_with_its_active_color);
+    RUN_TEST(test_filled_slider_discards_preview_on_touch_reset_and_screen_change);
     RUN_TEST(test_wide_slider_uses_larger_label_and_value_text);
     RUN_TEST(test_keyboard_edits_and_submits);
     RUN_TEST(test_orientation_owns_graphics_touch_and_hourglass_cache);
